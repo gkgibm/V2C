@@ -14,7 +14,7 @@
  */
 
 import * as vscode from "vscode";
-import * as WebSocket from "ws";
+import WebSocket = require("ws");
 
 // ── Message type constants (must match v2c/bridge/protocol.py) ────────────────
 
@@ -102,12 +102,7 @@ export class V2CBridge {
     const { host, port } = this.config();
     const url = `ws://${host}:${port}`;
 
-    try {
-      this.ws = new (require("ws"))(url);
-    } catch {
-      // ws not available in web extensions; use the native browser WebSocket
-      this.ws = new WebSocket(url) as unknown as WebSocket;
-    }
+    this.ws = new WebSocket(url);
 
     this.ws.on("open", () => {
       this.retryDelay = INITIAL_RETRY_MS;
