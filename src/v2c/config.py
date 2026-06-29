@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal  # still used for str Literal fields (asr_model, log_level, etc.)
 
 from dotenv import load_dotenv
 from pydantic import Field, model_validator
@@ -55,17 +55,21 @@ class Settings(BaseSettings):
     )
 
     # ── Voice Activity Detection ─────────────────────────────────────────────
-    vad_aggressiveness: Literal[0, 1, 2, 3] = Field(
+    # Note: these are plain int fields (not Literal[int]) so that pydantic-settings
+    # can coerce the env-var string "2" → int before validation.
+    vad_aggressiveness: int = Field(
         default=2,
-        description="WebRTC VAD aggressiveness. Higher = more aggressive.",
+        ge=0,
+        le=3,
+        description="WebRTC VAD aggressiveness (0–3). Higher = more aggressive.",
     )
-    sample_rate: Literal[8000, 16000, 32000, 48000] = Field(
+    sample_rate: int = Field(
         default=16000,
-        description="Audio sample rate in Hz. Must match VAD requirements.",
+        description="Audio sample rate in Hz. Must be 8000, 16000, 32000, or 48000.",
     )
-    vad_frame_ms: Literal[10, 20, 30] = Field(
+    vad_frame_ms: int = Field(
         default=30,
-        description="Frame duration in ms for VAD chunking.",
+        description="VAD frame duration in ms. Must be 10, 20, or 30.",
     )
     vad_silence_threshold: float = Field(
         default=0.8,
