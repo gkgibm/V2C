@@ -21,6 +21,8 @@ import WebSocket = require("ws");
 export const MSG = {
   // Client → Server
   CONTEXT: "CONTEXT",
+  START_RECORDING: "START_RECORDING",
+  STOP_RECORDING: "STOP_RECORDING",
   AUDIO_CHUNK: "AUDIO_CHUNK",
   AUDIO_STOP: "AUDIO_STOP",
   ACK: "ACK",
@@ -152,6 +154,14 @@ export class V2CBridge {
 
   sendContext(ctx: EditorContext): void {
     this._send({ type: MSG.CONTEXT, context: ctx });
+  }
+
+  sendStartRecording(): void {
+    this._send({ type: MSG.START_RECORDING });
+  }
+
+  sendStopRecording(): void {
+    this._send({ type: MSG.STOP_RECORDING });
   }
 
   sendAudioChunk(pcmBase64: string): void {

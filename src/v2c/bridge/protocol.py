@@ -38,8 +38,10 @@ from pydantic import BaseModel, Field
 class MessageType(str, Enum):
     # Client → Server
     CONTEXT = "CONTEXT"
-    AUDIO_CHUNK = "AUDIO_CHUNK"
-    AUDIO_STOP = "AUDIO_STOP"
+    START_RECORDING = "START_RECORDING"   # ask server to open its mic
+    STOP_RECORDING = "STOP_RECORDING"     # ask server to stop and transcribe
+    AUDIO_CHUNK = "AUDIO_CHUNK"           # kept for future browser-side capture
+    AUDIO_STOP = "AUDIO_STOP"             # kept for compatibility
     ACK = "ACK"
     ERROR = "ERROR"
 
@@ -81,6 +83,16 @@ class ContextMessage(BaseModel):
     context: EditorContext
 
 
+class StartRecordingMessage(BaseModel):
+    """Ask the Python server to open its microphone and start recording."""
+    type: Literal[MessageType.START_RECORDING] = MessageType.START_RECORDING
+
+
+class StopRecordingMessage(BaseModel):
+    """Ask the Python server to stop recording and run the transcription pipeline."""
+    type: Literal[MessageType.STOP_RECORDING] = MessageType.STOP_RECORDING
+
+
 class AudioChunkMessage(BaseModel):
     """
     A chunk of raw PCM audio encoded as a base64 string.
@@ -94,7 +106,7 @@ class AudioChunkMessage(BaseModel):
 
 
 class AudioStopMessage(BaseModel):
-    """Signal that the user has released the mic button."""
+    """Signal that the user has released the mic button (browser-side capture)."""
     type: Literal[MessageType.AUDIO_STOP] = MessageType.AUDIO_STOP
 
 
@@ -152,6 +164,8 @@ class ServerErrorMessage(BaseModel):
 
 ClientMessage = Union[
     ContextMessage,
+    StartRecordingMessage,
+    StopRecordingMessage,
     AudioChunkMessage,
     AudioStopMessage,
     AckMessage,
@@ -178,6 +192,8 @@ def parse_client_message(raw: str | bytes) -> ClientMessage:
 
     _MAP: dict[str, type[BaseModel]] = {
         MessageType.CONTEXT: ContextMessage,
+        MessageType.START_RECORDING: StartRecordingMessage,
+        MessageType.STOP_RECORDING: StopRecordingMessage,
         MessageType.AUDIO_CHUNK: AudioChunkMessage,
         MessageType.AUDIO_STOP: AudioStopMessage,
         MessageType.ACK: AckMessage,
