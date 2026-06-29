@@ -1,0 +1,94 @@
+{
+  "name": "v2c-vscode",
+  "displayName": "V2C – Voice to Code",
+  "description": "Privacy-first, AST-aware voice coding for Python (Phase 1 MVP)",
+  "version": "0.1.0",
+  "publisher": "v2c",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Other", "Programming Languages"],
+  "keywords": ["voice", "speech", "coding", "accessibility", "python", "ast"],
+  "activationEvents": ["onLanguage:python", "onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "v2c.startListening",
+        "title": "V2C: Start Listening",
+        "icon": "$(mic)"
+      },
+      {
+        "command": "v2c.stopListening",
+        "title": "V2C: Stop Listening",
+        "icon": "$(mic-filled)"
+      },
+      {
+        "command": "v2c.toggleListening",
+        "title": "V2C: Toggle Listening"
+      },
+      {
+        "command": "v2c.showStatus",
+        "title": "V2C: Show Status"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "v2c.toggleListening",
+        "key": "ctrl+shift+v",
+        "mac": "cmd+shift+v",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "V2C – Voice to Code",
+      "properties": {
+        "v2c.serverPort": {
+          "type": "number",
+          "default": 6789,
+          "description": "Port of the V2C Python WebSocket server."
+        },
+        "v2c.serverHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host of the V2C Python WebSocket server."
+        },
+        "v2c.showTranscript": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the refined transcript in the status bar while processing."
+        },
+        "v2c.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically attempt to connect to the V2C server on startup."
+        }
+      }
+    },
+    "menus": {
+      "editor/title": [
+        {
+          "command": "v2c.toggleListening",
+          "group": "navigation",
+          "when": "editorLangId == python"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "pretest": "npm run compile",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,0 +1,189 @@
+"""
+WebSocket bridge protocol — message schemas.
+
+All communication between the VS Code extension (client) and the V2C
+Python backend (server) uses newline-delimited JSON messages over a
+WebSocket connection on ``ws://127.0.0.1:6789``.
+
+Message flow::
+
+    VS Code extension                V2C Python server
+    ──────────────────               ─────────────────
+    CONTEXT (editor state)  ──────▶
+                            ◀──────  STATUS (listening)
+    AUDIO_CHUNK (raw PCM)   ──────▶
+    AUDIO_STOP              ──────▶
+                            ◀──────  TRANSCRIPT (raw ASR)
+                            ◀──────  ACTION (EditorAction JSON)
+    ACK / ERROR             ──────▶
+
+All message types are discriminated by the ``type`` field.
+
+Pydantic models are used for validation and serialisation.
+"""
+
+from __future__ import annotations
+
+import json
+from enum import Enum
+from typing import Any, Literal, Union
+
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Message types (discriminator values)
+# ---------------------------------------------------------------------------
+
+class MessageType(str, Enum):
+    # Client → Server
+    CONTEXT = "CONTEXT"
+    AUDIO_CHUNK = "AUDIO_CHUNK"
+    AUDIO_STOP = "AUDIO_STOP"
+    ACK = "ACK"
+    ERROR = "ERROR"
+
+    # Server → Client
+    STATUS = "STATUS"
+    TRANSCRIPT = "TRANSCRIPT"
+    ACTION = "ACTION"
+    SERVER_ERROR = "SERVER_ERROR"
+
+
+class ListeningStatus(str, Enum):
+    READY = "READY"
+    LISTENING = "LISTENING"
+    PROCESSING = "PROCESSING"
+    IDLE = "IDLE"
+
+
+# ---------------------------------------------------------------------------
+# Client → Server messages
+# ---------------------------------------------------------------------------
+
+class EditorContext(BaseModel):
+    """Current state of the VS Code editor, sent before each recording."""
+
+    active_file: str = ""
+    language: str = "python"
+    # Content of the active file (used for AST parsing and context injection).
+    # May be truncated to the last 2000 lines to stay within token budgets.
+    source_code: str = ""
+    # Cursor position (0-based line and character).
+    cursor_line: int = 0
+    cursor_char: int = 0
+    # Currently selected text (may be empty).
+    selected_text: str = ""
+
+
+class ContextMessage(BaseModel):
+    type: Literal[MessageType.CONTEXT] = MessageType.CONTEXT
+    context: EditorContext
+
+
+class AudioChunkMessage(BaseModel):
+    """
+    A chunk of raw PCM audio encoded as a base64 string.
+
+    Format: mono, 16-bit little-endian PCM at the sample rate configured
+    in the Python server (default 16 kHz).
+    """
+    type: Literal[MessageType.AUDIO_CHUNK] = MessageType.AUDIO_CHUNK
+    # Base64-encoded raw PCM bytes.
+    data_b64: str
+
+
+class AudioStopMessage(BaseModel):
+    """Signal that the user has released the mic button."""
+    type: Literal[MessageType.AUDIO_STOP] = MessageType.AUDIO_STOP
+
+
+class AckMessage(BaseModel):
+    """Acknowledge a server action was successfully applied."""
+    type: Literal[MessageType.ACK] = MessageType.ACK
+    action_id: str = ""
+
+
+class ClientErrorMessage(BaseModel):
+    """Report an error from the extension side."""
+    type: Literal[MessageType.ERROR] = MessageType.ERROR
+    message: str
+
+
+# ---------------------------------------------------------------------------
+# Server → Client messages
+# ---------------------------------------------------------------------------
+
+class StatusMessage(BaseModel):
+    """Inform the extension about the server's current listening state."""
+    type: Literal[MessageType.STATUS] = MessageType.STATUS
+    status: ListeningStatus
+    detail: str = ""
+
+
+class TranscriptMessage(BaseModel):
+    """Deliver the raw ASR transcript before action execution."""
+    type: Literal[MessageType.TRANSCRIPT] = MessageType.TRANSCRIPT
+    raw: str
+    refined: str
+
+
+class ActionMessage(BaseModel):
+    """
+    Deliver the computed editor action to the VS Code extension.
+
+    ``action`` is the raw dict from :meth:`EditorAction.to_dict()`.
+    The extension deserialises it based on the ``action_type`` field.
+    """
+    type: Literal[MessageType.ACTION] = MessageType.ACTION
+    action_id: str
+    action: dict[str, Any]
+
+
+class ServerErrorMessage(BaseModel):
+    """Report a server-side processing error to the extension."""
+    type: Literal[MessageType.SERVER_ERROR] = MessageType.SERVER_ERROR
+    message: str
+
+
+# ---------------------------------------------------------------------------
+# Discriminated union helper
+# ---------------------------------------------------------------------------
+
+ClientMessage = Union[
+    ContextMessage,
+    AudioChunkMessage,
+    AudioStopMessage,
+    AckMessage,
+    ClientErrorMessage,
+]
+
+ServerMessage = Union[
+    StatusMessage,
+    TranscriptMessage,
+    ActionMessage,
+    ServerErrorMessage,
+]
+
+
+def parse_client_message(raw: str | bytes) -> ClientMessage:
+    """
+    Deserialise a raw JSON string from the extension into a typed message.
+
+    Raises:
+        ValueError: if the message type is unknown or the schema is invalid.
+    """
+    data = json.loads(raw)
+    msg_type = data.get("type", "")
+
+    _MAP: dict[str, type[BaseModel]] = {
+        MessageType.CONTEXT: ContextMessage,
+        MessageType.AUDIO_CHUNK: AudioChunkMessage,
+        MessageType.AUDIO_STOP: AudioStopMessage,
+        MessageType.ACK: AckMessage,
+        MessageType.ERROR: ClientErrorMessage,
+    }
+    cls = _MAP.get(msg_type)
+    if cls is None:
+        raise ValueError(f"Unknown client message type: {msg_type!r}")
+    return cls.model_validate(data)
