@@ -157,22 +157,24 @@ class TranscriptMessage(BaseModel):
 
 class LiveActionMessage(BaseModel):
     """
-    One or more live code edits produced from a (partial) transcript.
+    A live code edit produced from a (partial or final) transcript.
 
-    ``actions`` is a list of action dicts, one per command segment separated
-    by "next line" markers in the utterance. The extension applies them in
-    order, inserting ``newlines_after`` newlines between each pair.
+    Two modes:
+    1. ``raw_code`` is set (non-empty):
+       The extension inserts this string verbatim at the cursor.
+       Used when an Ollama LLM generated the code directly.
 
-    ``is_partial=True``:  applied immediately; will be undone when the next
-                          partial update arrives.
-    ``is_partial=False``: final clean result — kept permanently.
+    2. ``actions`` is set (non-empty):
+       The extension dispatches each action dict in order (rule-based fallback).
+       Each dict has action_type fields + ``newlines_after`` (int).
 
-    Each element of ``actions`` has the same dict shape as ActionMessage.action
-    plus an extra ``newlines_after`` key (int, default 0).
+    ``is_partial=True``:  applied immediately; undone on next update.
+    ``is_partial=False``: final result — kept permanently.
     """
     type: Literal[MessageType.LIVE_ACTION] = MessageType.LIVE_ACTION
     action_id: str
-    actions: list[dict[str, Any]]   # list of {action_dict..., newlines_after: int}
+    raw_code: str = ""              # LLM-generated code (preferred path)
+    actions: list[dict[str, Any]] = Field(default_factory=list)   # rule fallback
     is_partial: bool = True
 
 

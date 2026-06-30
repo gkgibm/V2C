@@ -90,6 +90,28 @@ class Settings(BaseSettings):
     ws_host: str = Field(default="127.0.0.1", description="WebSocket server bind host.")
     ws_port: int = Field(default=6789, ge=1024, le=65535, description="WebSocket port.")
 
+    # ── Ollama (local LLM code generation) ───────────────────────────────────
+    ollama_host: str = Field(
+        default="http://127.0.0.1:11434",
+        description="Base URL of the local Ollama server.",
+    )
+    ollama_model: str = Field(
+        default="qwen3:1.7b",
+        description="Ollama model for voice-to-code generation. qwen3:1.7b recommended.",
+    )
+    ollama_timeout: float = Field(
+        default=8.0,
+        ge=1.0,
+        description="HTTP timeout (s) for a single Ollama generate call.",
+    )
+    ollama_enabled: bool = Field(
+        default=True,
+        description=(
+            "Use local Ollama for code generation. "
+            "Falls back to rule-based pipeline when False or Ollama unreachable."
+        ),
+    )
+
     # ── LLM Refinement ───────────────────────────────────────────────────────
     refine_enabled: bool = Field(
         default=True,

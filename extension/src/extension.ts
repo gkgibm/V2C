@@ -170,6 +170,8 @@ function _handleStatus(msg: StatusMessage): void {
 }
 
 async function _handleLiveAction(msg: LiveActionMessage): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+
   // Step 1 — undo the previous partial batch so we start from a clean slate.
   if (_pendingUndoSteps > 0) {
     for (let i = 0; i < _pendingUndoSteps; i++) {
@@ -178,26 +180,34 @@ async function _handleLiveAction(msg: LiveActionMessage): Promise<void> {
     _pendingUndoSteps = 0;
   }
 
-  // Step 2 — apply every action in the list, inserting newlines between them.
   let totalSteps = 0;
-  for (const action of msg.actions) {
-    const actionType = (action["action_type"] as string) ?? "";
-    const steps = await _applyAction(actionType, action);
-    totalSteps += steps;
 
-    // Insert the requested newlines after this action (before the next one).
-    const newlinesAfter = (action["newlines_after"] as number) ?? 0;
-    if (newlinesAfter > 0) {
-      for (let i = 0; i < newlinesAfter; i++) {
-        await vscode.commands.executeCommand("editor.action.insertLineAfter");
+  if (msg.raw_code && msg.raw_code.trim()) {
+    // ── LLM path: insert the raw code string directly at cursor ────────────
+    if (editor) {
+      const code = msg.raw_code;
+      await editor.edit((eb) => eb.insert(editor.selection.active, code));
+      totalSteps = 1;
+    }
+  } else if (msg.actions && msg.actions.length > 0) {
+    // ── Rule fallback path: apply each action + newlines ───────────────────
+    for (const action of msg.actions) {
+      const actionType = (action["action_type"] as string) ?? "";
+      const steps = await _applyAction(actionType, action);
+      totalSteps += steps;
+
+      const newlinesAfter = (action["newlines_after"] as number) ?? 0;
+      if (newlinesAfter > 0) {
+        for (let i = 0; i < newlinesAfter; i++) {
+          await vscode.commands.executeCommand("editor.action.insertLineAfter");
+        }
+        totalSteps += newlinesAfter;
       }
-      totalSteps += newlinesAfter;
     }
   }
 
   if (msg.is_partial) {
     _pendingUndoSteps = totalSteps;
-    // Don't ack partial — server doesn't wait.
   } else {
     _pendingUndoSteps = 0;
     bridge?.sendAck(msg.action_id);

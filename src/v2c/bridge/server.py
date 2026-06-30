@@ -51,7 +51,7 @@ from v2c.bridge.protocol import (
     parse_client_message,
 )
 from v2c.config import settings
-from v2c.intent import llm_parser, router, rules
+from v2c.intent import llm_code_gen, llm_parser, router, rules
 from v2c.intent.router import IntentType
 from v2c.intent.splitter import split as split_transcript
 
@@ -217,31 +217,42 @@ class SessionHandler:
 
     async def _run_partial_pipeline(self, text: str) -> None:
         """
-        Fast synchronous-only pipeline for partial transcripts.
+        Pipeline for partial transcripts (fired every ~1s while speaking).
 
-        Splits on "next line" markers, dispatches each segment through
-        rule-based router+dispatcher (~5ms total), sends a single
-        LIVE_ACTION(is_partial=True) carrying all resulting actions.
+        Primary path: Ollama LLM generates code directly (~500ms).
+        Fallback: rule-based splitter+dispatcher if Ollama is unavailable.
         """
         if not text.strip():
             return
 
-        segments = split_transcript(text)
-        logger.info("▶ Partial split: %d segment(s) from %r", len(segments), text[:80])
+        action_id = str(uuid.uuid4())
 
+        if settings.ollama_enabled:
+            code = await llm_code_gen.generate_code(
+                text,
+                context_code=self._context.source_code[-800:],
+            )
+            if code:
+                await self._send(LiveActionMessage(
+                    action_id=action_id,
+                    raw_code=code,
+                    is_partial=True,
+                ))
+                logger.info("→ LIVE_ACTION(partial/llm) id=%s %d chars", action_id[:8], len(code))
+                return
+
+        # Fallback: rule-based
+        segments = split_transcript(text)
         action_dicts = _segments_to_action_dicts(segments)
         if not action_dicts:
             return
 
-        action_id = str(uuid.uuid4())
         await self._send(LiveActionMessage(
             action_id=action_id,
             actions=action_dicts,
             is_partial=True,
         ))
-        logger.info(
-            "→ LIVE_ACTION(partial) id=%s %d action(s)", action_id[:8], len(action_dicts)
-        )
+        logger.info("→ LIVE_ACTION(partial/rules) id=%s %d segments", action_id[:8], len(action_dicts))
 
     def _handle_audio_chunk(self, msg: AudioChunkMessage) -> None:
         """Legacy: buffer PCM chunks sent from the client."""
@@ -300,10 +311,25 @@ class SessionHandler:
         await self._send(TranscriptMessage(raw=raw_transcript, refined=refined))
         logger.info("Transcript — raw: %r  refined: %r", raw_transcript, refined)
 
-        # ── 4. Split on "next line" markers, dispatch each segment ────────
-        segments = split_transcript(refined)
-        logger.info("Final split: %d segment(s) from %r", len(segments), refined[:80])
+        # ── 4. Generate code: Ollama LLM (preferred) or rule fallback ────
+        action_id = str(uuid.uuid4())
 
+        if settings.ollama_enabled:
+            code = await llm_code_gen.generate_code(
+                refined,
+                context_code=self._context.source_code[-800:],
+            )
+            if code:
+                await self._send(LiveActionMessage(
+                    action_id=action_id,
+                    raw_code=code,
+                    is_partial=False,
+                ))
+                logger.info("→ LIVE_ACTION(final/llm) id=%s %d chars", action_id[:8], len(code))
+                return
+
+        # Fallback: rule-based splitter
+        segments = split_transcript(refined)
         action_dicts: list[dict] = []
         for seg_text, newlines_after in segments:
             seg_routing = router.classify(seg_text)
@@ -315,25 +341,18 @@ class SessionHandler:
                 from v2c.ast_engine.editor_action import DictationAction
                 if isinstance(action, DictationAction) and settings.use_llm:
                     action = await llm_parser.parse(seg_text, refine_ctx)
-            else:  # AMBIGUOUS
-                if settings.use_llm:
-                    action = await llm_parser.parse(seg_text, refine_ctx)
-                else:
-                    action = rules.dispatch(seg_text)
+            else:
+                action = rules.dispatch(seg_text)
             d = action.to_dict()
             d["newlines_after"] = newlines_after
             action_dicts.append(d)
 
-        # ── 5. Send final live action list (is_partial=False) ─────────────
-        action_id = str(uuid.uuid4())
         await self._send(LiveActionMessage(
             action_id=action_id,
             actions=action_dicts,
             is_partial=False,
         ))
-        logger.info(
-            "→ LIVE_ACTION(final) id=%s %d action(s)", action_id[:8], len(action_dicts)
-        )
+        logger.info("→ LIVE_ACTION(final/rules) id=%s %d segments", action_id[:8], len(action_dicts))
 
     # ------------------------------------------------------------------ #
     # Main message loop
@@ -394,10 +413,13 @@ async def start_server() -> None:
     asr = ASREngine()
     await asr.warmup()
 
-    # Pre-warm the streaming engine at startup so the first recording session
-    # has zero model-load latency (loads in executor, non-blocking).
+    # Pre-warm the streaming engine at startup.
     streamer = StreamingASREngine()
     await streamer.warmup()
+
+    # Warm up the Ollama LLM (loads model into GPU/CPU memory).
+    if settings.ollama_enabled:
+        await llm_code_gen.warmup()
 
     async def handler(ws: Any) -> None:
         session = SessionHandler(ws, asr, streamer)

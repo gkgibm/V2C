@@ -74,7 +74,9 @@ export interface PartialTranscriptMessage {
 export interface LiveActionMessage {
   type: "LIVE_ACTION";
   action_id: string;
-  /** One action per command segment. Each dict has action_type + newlines_after. */
+  /** LLM-generated code (preferred path) — insert verbatim at cursor. */
+  raw_code: string;
+  /** Rule-based fallback — list of action dicts, each with newlines_after. */
   actions: Array<Record<string, unknown>>;
   is_partial: boolean;
 }
