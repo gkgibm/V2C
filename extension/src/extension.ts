@@ -170,7 +170,7 @@ function _handleStatus(msg: StatusMessage): void {
 }
 
 async function _handleLiveAction(msg: LiveActionMessage): Promise<void> {
-  // Step 1 — undo the previous partial edit so we start from a clean slate.
+  // Step 1 — undo the previous partial batch so we start from a clean slate.
   if (_pendingUndoSteps > 0) {
     for (let i = 0; i < _pendingUndoSteps; i++) {
       await vscode.commands.executeCommand("undo");
@@ -178,14 +178,27 @@ async function _handleLiveAction(msg: LiveActionMessage): Promise<void> {
     _pendingUndoSteps = 0;
   }
 
+  // Step 2 — apply every action in the list, inserting newlines between them.
+  let totalSteps = 0;
+  for (const action of msg.actions) {
+    const actionType = (action["action_type"] as string) ?? "";
+    const steps = await _applyAction(actionType, action);
+    totalSteps += steps;
+
+    // Insert the requested newlines after this action (before the next one).
+    const newlinesAfter = (action["newlines_after"] as number) ?? 0;
+    if (newlinesAfter > 0) {
+      for (let i = 0; i < newlinesAfter; i++) {
+        await vscode.commands.executeCommand("editor.action.insertLineAfter");
+      }
+      totalSteps += newlinesAfter;
+    }
+  }
+
   if (msg.is_partial) {
-    // Step 2 — apply the new partial code into the document.
-    const steps = await _applyAction(msg.action["action_type"] as string, msg.action);
-    _pendingUndoSteps = steps;
-    // Don't ack partial actions — server doesn't wait for it.
+    _pendingUndoSteps = totalSteps;
+    // Don't ack partial — server doesn't wait.
   } else {
-    // Final action: apply and keep. Reset undo state.
-    await _applyAction(msg.action["action_type"] as string, msg.action);
     _pendingUndoSteps = 0;
     bridge?.sendAck(msg.action_id);
     _setStatus("idle");

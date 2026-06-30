@@ -53,8 +53,46 @@ from v2c.bridge.protocol import (
 from v2c.config import settings
 from v2c.intent import llm_parser, router, rules
 from v2c.intent.router import IntentType
+from v2c.intent.splitter import split as split_transcript
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _segments_to_action_dicts(
+    segments: list[tuple[str, int]],
+) -> list[dict]:
+    """
+    Convert (command_text, newlines_after) pairs from the splitter into
+    a list of action dicts ready for LiveActionMessage.actions.
+
+    Uses rule-based router + dispatcher only (no LLM, no async).
+    """
+    from v2c.ast_engine.editor_action import DictationAction, NewlineAction
+
+    result: list[dict] = []
+    for seg_text, newlines_after in segments:
+        seg_text = seg_text.strip()
+        if not seg_text:
+            continue
+        routing = router.classify(seg_text)
+        if routing.intent == IntentType.DICTATION:
+            action = DictationAction(text=seg_text)
+        else:
+            action = rules.dispatch(seg_text)
+            # If the rule dispatcher returned a NewlineAction for something
+            # like "next line" that slipped through the splitter, absorb it.
+            if isinstance(action, NewlineAction):
+                newlines_after += action.count
+                continue  # don't emit a separate action for it
+        d = action.to_dict()
+        d["newlines_after"] = newlines_after
+        result.append(d)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -181,30 +219,29 @@ class SessionHandler:
         """
         Fast synchronous-only pipeline for partial transcripts.
 
-        Skips: ASR (text already transcribed), LLM refiner, LLM parser.
-        Uses only: rule-based router + rule-based dispatcher.
-        This keeps latency under ~5ms so live edits feel instant.
+        Splits on "next line" markers, dispatches each segment through
+        rule-based router+dispatcher (~5ms total), sends a single
+        LIVE_ACTION(is_partial=True) carrying all resulting actions.
         """
         if not text.strip():
             return
 
-        routing = router.classify(text)
-        logger.info("▶ Partial pipeline: %r → %s", text[:60], routing.intent.name)
+        segments = split_transcript(text)
+        logger.info("▶ Partial split: %d segment(s) from %r", len(segments), text[:80])
 
-        if routing.intent == IntentType.DICTATION:
-            from v2c.ast_engine.editor_action import DictationAction
-            action = DictationAction(text=text)
-        else:
-            # COMMAND or AMBIGUOUS — try rules; fall back to dictation
-            action = rules.dispatch(text)
+        action_dicts = _segments_to_action_dicts(segments)
+        if not action_dicts:
+            return
 
         action_id = str(uuid.uuid4())
         await self._send(LiveActionMessage(
             action_id=action_id,
-            action=action.to_dict(),
+            actions=action_dicts,
             is_partial=True,
         ))
-        logger.info("→ LIVE_ACTION(partial) id=%s type=%s", action_id[:8], type(action).__name__)
+        logger.info(
+            "→ LIVE_ACTION(partial) id=%s %d action(s)", action_id[:8], len(action_dicts)
+        )
 
     def _handle_audio_chunk(self, msg: AudioChunkMessage) -> None:
         """Legacy: buffer PCM chunks sent from the client."""
@@ -263,31 +300,40 @@ class SessionHandler:
         await self._send(TranscriptMessage(raw=raw_transcript, refined=refined))
         logger.info("Transcript — raw: %r  refined: %r", raw_transcript, refined)
 
-        # ── 4. Intent routing ─────────────────────────────────────────────
-        routing = router.classify(refined)
-        logger.debug("Intent: %s (confidence=%.2f)", routing.intent.name, routing.confidence)
+        # ── 4. Split on "next line" markers, dispatch each segment ────────
+        segments = split_transcript(refined)
+        logger.info("Final split: %d segment(s) from %r", len(segments), refined[:80])
 
-        if routing.intent == IntentType.DICTATION:
-            from v2c.ast_engine.editor_action import DictationAction
-            action = DictationAction(text=refined)
+        action_dicts: list[dict] = []
+        for seg_text, newlines_after in segments:
+            seg_routing = router.classify(seg_text)
+            if seg_routing.intent == IntentType.DICTATION:
+                from v2c.ast_engine.editor_action import DictationAction
+                action = DictationAction(text=seg_text)
+            elif seg_routing.intent == IntentType.COMMAND:
+                action = rules.dispatch(seg_text)
+                from v2c.ast_engine.editor_action import DictationAction
+                if isinstance(action, DictationAction) and settings.use_llm:
+                    action = await llm_parser.parse(seg_text, refine_ctx)
+            else:  # AMBIGUOUS
+                if settings.use_llm:
+                    action = await llm_parser.parse(seg_text, refine_ctx)
+                else:
+                    action = rules.dispatch(seg_text)
+            d = action.to_dict()
+            d["newlines_after"] = newlines_after
+            action_dicts.append(d)
 
-        elif routing.intent == IntentType.COMMAND:
-            action = rules.dispatch(refined)
-            from v2c.ast_engine.editor_action import DictationAction
-            if isinstance(action, DictationAction) and settings.use_llm:
-                action = await llm_parser.parse(refined, refine_ctx)
-
-        else:  # AMBIGUOUS
-            action = await llm_parser.parse(refined, refine_ctx)
-
-        # ── 5. Send final live action (is_partial=False) — replaces last partial
+        # ── 5. Send final live action list (is_partial=False) ─────────────
         action_id = str(uuid.uuid4())
         await self._send(LiveActionMessage(
             action_id=action_id,
-            action=action.to_dict(),
+            actions=action_dicts,
             is_partial=False,
         ))
-        logger.info("→ LIVE_ACTION(final) id=%s type=%s", action_id[:8], type(action).__name__)
+        logger.info(
+            "→ LIVE_ACTION(final) id=%s %d action(s)", action_id[:8], len(action_dicts)
+        )
 
     # ------------------------------------------------------------------ #
     # Main message loop

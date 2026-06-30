@@ -157,21 +157,22 @@ class TranscriptMessage(BaseModel):
 
 class LiveActionMessage(BaseModel):
     """
-    A live code edit produced from a partial transcript while the user is
-    still speaking.
+    One or more live code edits produced from a (partial) transcript.
 
-    ``is_partial=True``: the extension applies this edit immediately, but
-    records it for undo if the next partial produces a different result.
+    ``actions`` is a list of action dicts, one per command segment separated
+    by "next line" markers in the utterance. The extension applies them in
+    order, inserting ``newlines_after`` newlines between each pair.
 
-    ``is_partial=False``: this is the final clean result from the full
-    pipeline after stop — the extension keeps it permanently.
+    ``is_partial=True``:  applied immediately; will be undone when the next
+                          partial update arrives.
+    ``is_partial=False``: final clean result — kept permanently.
 
-    ``action`` carries the same dict shape as ActionMessage.action, so the
-    same _applyAction() handler is reused.
+    Each element of ``actions`` has the same dict shape as ActionMessage.action
+    plus an extra ``newlines_after`` key (int, default 0).
     """
     type: Literal[MessageType.LIVE_ACTION] = MessageType.LIVE_ACTION
     action_id: str
-    action: dict[str, Any]
+    actions: list[dict[str, Any]]   # list of {action_dict..., newlines_after: int}
     is_partial: bool = True
 
 

@@ -74,7 +74,8 @@ export interface PartialTranscriptMessage {
 export interface LiveActionMessage {
   type: "LIVE_ACTION";
   action_id: string;
-  action: Record<string, unknown>;
+  /** One action per command segment. Each dict has action_type + newlines_after. */
+  actions: Array<Record<string, unknown>>;
   is_partial: boolean;
 }
 
