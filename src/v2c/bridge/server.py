@@ -110,7 +110,7 @@ class SessionHandler:
             return
 
         try:
-            self._streamer = StreamingASREngine(self._asr._model)
+            self._streamer = StreamingASREngine()
             self._streamer.start()
             await self._send_status(ListeningStatus.LISTENING, "Microphone open")
 
