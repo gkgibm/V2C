@@ -21,7 +21,7 @@
  */
 
 import * as vscode from "vscode";
-import { V2CBridge, ActionMessage, TranscriptMessage, StatusMessage } from "./bridge";
+import { V2CBridge, ActionMessage, TranscriptMessage, StatusMessage, PartialTranscriptMessage } from "./bridge";
 
 // ── Action type constants (must match editor_action.py) ──────────────────────
 
@@ -44,10 +44,20 @@ let bridge: V2CBridge | null = null;
 let statusBarItem: vscode.StatusBarItem | null = null;
 let isListening = false;
 
-// Decoration type for showing the refined transcript inline
+// Decoration type for showing the refined transcript inline (final, shown for 4s)
 const transcriptDecorationType = vscode.window.createTextEditorDecorationType({
   after: {
     color: new vscode.ThemeColor("editorCodeLens.foreground"),
+    fontStyle: "italic",
+    margin: "0 0 0 2em",
+  },
+});
+
+// Decoration type for live ghost text while the user is speaking (partial transcript)
+// Rendered in a more muted, ephemeral style — always replaced or cleared before final.
+const partialDecorationType = vscode.window.createTextEditorDecorationType({
+  after: {
+    color: new vscode.ThemeColor("editorGhostText.foreground"),
     fontStyle: "italic",
     margin: "0 0 0 2em",
   },
@@ -70,6 +80,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Bridge
   bridge = new V2CBridge(config);
   bridge.onStatus.event(_handleStatus);
+  bridge.onPartialTranscript.event(_handlePartialTranscript);
   bridge.onTranscript.event(_handleTranscript);
   bridge.onAction.event(_handleAction);
   bridge.onServerError.event((msg) => {
@@ -98,6 +109,7 @@ export function activate(context: vscode.ExtensionContext): void {
 export function deactivate(): void {
   bridge?.dispose();
   transcriptDecorationType.dispose();
+  partialDecorationType.dispose();
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -171,6 +183,26 @@ function _handleStatus(msg: StatusMessage): void {
       _setStatus("processing");
       break;
   }
+}
+
+function _handlePartialTranscript(msg: PartialTranscriptMessage): void {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) { return; }
+
+  // is_final=true is sent by the server to clear the ghost text before the
+  // final ACTION arrives (prevents a flash of stale partial text).
+  if (msg.is_final || !msg.text.trim()) {
+    editor.setDecorations(partialDecorationType, []);
+    return;
+  }
+
+  const line = editor.selection.active.line;
+  const eol  = new vscode.Position(line, editor.document.lineAt(line).range.end.character);
+
+  editor.setDecorations(partialDecorationType, [{
+    range: new vscode.Range(eol, eol),
+    renderOptions: { after: { contentText: ` 🎤 ${msg.text}` } },
+  }]);
 }
 
 function _handleTranscript(msg: TranscriptMessage): void {

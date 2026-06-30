@@ -47,7 +47,8 @@ class MessageType(str, Enum):
 
     # Server → Client
     STATUS = "STATUS"
-    TRANSCRIPT = "TRANSCRIPT"
+    PARTIAL_TRANSCRIPT = "PARTIAL_TRANSCRIPT"  # live text while still speaking
+    TRANSCRIPT = "TRANSCRIPT"                  # final transcript after stop
     ACTION = "ACTION"
     SERVER_ERROR = "SERVER_ERROR"
 
@@ -133,8 +134,21 @@ class StatusMessage(BaseModel):
     detail: str = ""
 
 
+class PartialTranscriptMessage(BaseModel):
+    """
+    Live partial transcript — sent while the user is still speaking.
+
+    The extension shows this as ghost/preview text at the cursor so the
+    user gets immediate visual feedback. It is NOT acted upon — only the
+    final TranscriptMessage triggers the command pipeline.
+    """
+    type: Literal[MessageType.PARTIAL_TRANSCRIPT] = MessageType.PARTIAL_TRANSCRIPT
+    text: str          # accumulated partial text so far
+    is_final: bool = False
+
+
 class TranscriptMessage(BaseModel):
-    """Deliver the raw ASR transcript before action execution."""
+    """Deliver the final ASR transcript after the user stops speaking."""
     type: Literal[MessageType.TRANSCRIPT] = MessageType.TRANSCRIPT
     raw: str
     refined: str
@@ -174,6 +188,7 @@ ClientMessage = Union[
 
 ServerMessage = Union[
     StatusMessage,
+    PartialTranscriptMessage,
     TranscriptMessage,
     ActionMessage,
     ServerErrorMessage,

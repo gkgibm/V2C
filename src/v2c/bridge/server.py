@@ -1,27 +1,20 @@
 """
 Async WebSocket server — the core IPC bridge.
 
-Audio capture model (revised):
-  The VS Code extension has no reliable cross-platform access to the
-  microphone (webview getUserMedia is blocked on non-https origins).
-  Instead the extension sends START_RECORDING / STOP_RECORDING commands
-  and the Python server captures audio locally via sounddevice.
+Audio flow (streaming):
 
-Architecture::
+  START_RECORDING received
+    └─ StreamingASREngine.start()   ← opens mic + background inference loop
+    └─ _stream_partials_task()      ← asyncio task: forwards partial text to
+                                       extension as PARTIAL_TRANSCRIPT messages
+                                       → extension shows live ghost text
 
-    asyncio event loop
-    │
-    ├── websockets.serve() listening on 127.0.0.1:6789
-    │     └── per-client coroutine → SessionHandler
-    │           ├── START_RECORDING  → spawn _record_task() in background
-    │           ├── STOP_RECORDING   → cancel _record_task(), run pipeline
-    │           ├── CONTEXT          → update editor state
-    │           └── pipeline:
-    │                 1. ASREngine.transcribe(audio)
-    │                 2. Refiner.refine(transcript, context)
-    │                 3. IntentRouter.classify(refined)
-    │                 4. RulesDispatcher or LLMParser
-    │                 5. Send ActionMessage to extension
+  STOP_RECORDING received
+    └─ StreamingASREngine.stop()    ← closes mic, returns full float32 audio
+    └─ _stream_partials_task cancelled
+    └─ final ASREngine.transcribe() ← one clean Whisper pass on full audio
+    └─ Refiner + Router + Rules/LLM
+    └─ ACTION message → extension   ← code inserted / command executed
 """
 
 from __future__ import annotations
@@ -38,6 +31,7 @@ import numpy as np
 from v2c.ast_engine import parser as ast_parser
 from v2c.asr.engine import ASREngine
 from v2c.asr.refiner import RefinementContext, get_refiner
+from v2c.asr.streaming import StreamingASREngine
 from v2c.bridge.protocol import (
     ActionMessage,
     AckMessage,
@@ -47,6 +41,7 @@ from v2c.bridge.protocol import (
     ContextMessage,
     EditorContext,
     ListeningStatus,
+    PartialTranscriptMessage,
     ServerErrorMessage,
     StartRecordingMessage,
     StopRecordingMessage,
@@ -59,66 +54,6 @@ from v2c.intent import llm_parser, router, rules
 from v2c.intent.router import IntentType
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Local microphone recorder (runs in background asyncio task)
-# ---------------------------------------------------------------------------
-
-class _MicRecorder:
-    """
-    Captures audio from the default system microphone using sounddevice.
-
-    Usage::
-
-        recorder = _MicRecorder()
-        recorder.start()          # opens mic stream
-        ...
-        audio = recorder.stop()   # closes stream, returns float32 array
-    """
-
-    def __init__(self) -> None:
-        self._frames: list[np.ndarray] = []
-        self._stream: Any = None
-
-    def start(self) -> None:
-        import sounddevice as sd  # type: ignore[import]
-
-        def _callback(
-            indata: np.ndarray,
-            _frames: int,
-            _time: object,
-            status: Any,
-        ) -> None:
-            if status:
-                logger.warning("sounddevice status: %s", status)
-            self._frames.append(indata[:, 0].copy())
-
-        self._stream = sd.InputStream(
-            samplerate=settings.sample_rate,
-            blocksize=settings.frames_per_chunk,
-            channels=1,
-            dtype="float32",
-            callback=_callback,
-        )
-        self._stream.start()
-        logger.info("Microphone recording started (sample_rate=%d Hz)", settings.sample_rate)
-
-    def stop(self) -> np.ndarray:
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-        if not self._frames:
-            logger.warning("No audio frames captured.")
-            return np.zeros(settings.sample_rate, dtype=np.float32)
-
-        audio = np.concatenate(self._frames)
-        self._frames.clear()
-        duration = len(audio) / settings.sample_rate
-        logger.info("Microphone recording stopped — captured %.2f s of audio", duration)
-        return audio
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +71,10 @@ class SessionHandler:
         self._asr = asr
         self._refiner = get_refiner()
         self._context: EditorContext = EditorContext()
-        self._recorder: _MicRecorder | None = None
-        # For legacy AUDIO_CHUNK mode (future browser capture)
+        # Streaming ASR — created fresh on each START_RECORDING
+        self._streamer: StreamingASREngine | None = None
+        self._partial_task: asyncio.Task | None = None
+        # Legacy: buffer for AUDIO_CHUNK mode
         self._pcm_buf: bytearray = bytearray()
 
     # ------------------------------------------------------------------ #
@@ -168,30 +105,49 @@ class SessionHandler:
         )
 
     async def _handle_start_recording(self, _msg: StartRecordingMessage) -> None:
-        if self._recorder is not None:
+        if self._streamer is not None:
             logger.warning("START_RECORDING received while already recording — ignoring")
             return
 
         try:
-            self._recorder = _MicRecorder()
-            self._recorder.start()
+            self._streamer = StreamingASREngine(self._asr._model)
+            self._streamer.start()
             await self._send_status(ListeningStatus.LISTENING, "Microphone open")
+
+            # Launch background task that forwards partial transcripts to extension
+            self._partial_task = asyncio.create_task(self._stream_partials())
+
         except Exception as exc:
             logger.error("Failed to open microphone: %s", exc)
             await self._send_error(
                 f"Could not open microphone: {exc}. "
-                "Check that no other app is using it and that sounddevice is installed."
+                "Check System Settings → Privacy → Microphone and that "
+                "sounddevice is installed."
             )
-            self._recorder = None
+            self._streamer = None
 
     async def _handle_stop_recording(self, _msg: StopRecordingMessage) -> None:
-        if self._recorder is None:
+        if self._streamer is None:
             logger.warning("STOP_RECORDING received but no active recording — ignoring")
             return
 
         await self._send_status(ListeningStatus.PROCESSING)
-        audio = self._recorder.stop()
-        self._recorder = None
+
+        # Stop streaming — returns the full captured audio
+        audio = self._streamer.stop()
+        self._streamer = None
+
+        # Cancel the partial-forwarding task
+        if self._partial_task is not None:
+            self._partial_task.cancel()
+            try:
+                await self._partial_task
+            except asyncio.CancelledError:
+                pass
+            self._partial_task = None
+
+        # Clear the live ghost text from the extension
+        await self._send(PartialTranscriptMessage(text="", is_final=True))
 
         try:
             await self._run_pipeline(audio)
@@ -200,6 +156,22 @@ class SessionHandler:
             await self._send_error(f"Pipeline failed: {exc}")
         finally:
             await self._send_status(ListeningStatus.READY)
+
+    async def _stream_partials(self) -> None:
+        """
+        Forward partial transcripts from StreamingASREngine to the extension.
+
+        Runs as an asyncio Task for the duration of a recording session.
+        Each partial update replaces the previous ghost text in the editor.
+        """
+        if self._streamer is None:
+            return
+        try:
+            async for text in self._streamer.partials():
+                await self._send(PartialTranscriptMessage(text=text))
+                logger.debug("Partial: %r", text[:60])
+        except asyncio.CancelledError:
+            pass  # normal — cancelled by _handle_stop_recording
 
     def _handle_audio_chunk(self, msg: AudioChunkMessage) -> None:
         """Legacy: buffer PCM chunks sent from the client."""
@@ -314,10 +286,13 @@ class SessionHandler:
         except Exception:
             pass
         finally:
-            # Clean up mic if client disconnects mid-recording
-            if self._recorder is not None:
-                self._recorder.stop()
-                self._recorder = None
+            # Clean up if client disconnects mid-recording
+            if self._streamer is not None:
+                self._streamer.stop()
+                self._streamer = None
+            if self._partial_task is not None:
+                self._partial_task.cancel()
+                self._partial_task = None
             logger.info("Client disconnected.")
 
 
