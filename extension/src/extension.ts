@@ -1,42 +1,44 @@
 /**
  * V2C VS Code Extension — Main entry point
  *
- * Audio capture model:
- *   getUserMedia is unavailable in VS Code webviews (blocked on non-https
- *   origins). Instead, the extension sends START_RECORDING / STOP_RECORDING
- *   commands over the WebSocket. The Python server (which has sounddevice
- *   already installed) captures the microphone locally and runs the full
- *   ASR → refine → classify → act pipeline.
+ * Live-code model:
+ *   As the user speaks, each partial ASR transcript is run through the fast
+ *   rule-based pipeline on the server. The result arrives as a
+ *   LIVE_ACTION(is_partial=true) message. The extension applies it to the
+ *   document immediately — real code appears as you speak.
+ *
+ *   When the next partial arrives the previous partial edit is undone first,
+ *   then the updated code is inserted. On stop, the server sends a final
+ *   LIVE_ACTION(is_partial=false) from the full ASR+refine pipeline. The
+ *   extension undoes the last partial and applies the final version once.
  *
  *   Flow:
  *     Cmd+Shift+V (start)
- *       → send CONTEXT (editor state for AST identifier extraction)
+ *       → send CONTEXT (editor state)
  *       → send START_RECORDING
- *       → server opens mic, status bar turns yellow
+ *       → every ~1s: LIVE_ACTION(partial) → undo prev → apply code live
  *     Cmd+Shift+V (stop)
  *       → send STOP_RECORDING
- *       → server closes mic, transcribes, classifies
- *       → server sends TRANSCRIPT + ACTION
- *       → extension applies ACTION as WorkspaceEdit
+ *       → LIVE_ACTION(final) → undo last partial → apply final clean code
  */
 
 import * as vscode from "vscode";
-import { V2CBridge, ActionMessage, TranscriptMessage, StatusMessage, PartialTranscriptMessage } from "./bridge";
+import { V2CBridge, ActionMessage, TranscriptMessage, StatusMessage, LiveActionMessage } from "./bridge";
 
 // ── Action type constants (must match editor_action.py) ──────────────────────
 
 const ACTION = {
-  DICTATION: "DICTATION",
-  ADD_FUNCTION: "ADD_FUNCTION",
-  ADD_CLASS: "ADD_CLASS",
-  ADD_METHOD: "ADD_METHOD",
+  DICTATION:       "DICTATION",
+  ADD_FUNCTION:    "ADD_FUNCTION",
+  ADD_CLASS:       "ADD_CLASS",
+  ADD_METHOD:      "ADD_METHOD",
   DELETE_FUNCTION: "DELETE_FUNCTION",
-  DELETE_CLASS: "DELETE_CLASS",
-  ADD_IMPORT: "ADD_IMPORT",
-  RENAME: "RENAME",
-  NAVIGATE: "NAVIGATE",
-  GENERATE: "GENERATE",
-  NEWLINE: "NEWLINE",
+  DELETE_CLASS:    "DELETE_CLASS",
+  ADD_IMPORT:      "ADD_IMPORT",
+  RENAME:          "RENAME",
+  NAVIGATE:        "NAVIGATE",
+  GENERATE:        "GENERATE",
+  NEWLINE:         "NEWLINE",
 } as const;
 
 // ── Extension state ───────────────────────────────────────────────────────────
@@ -45,24 +47,9 @@ let bridge: V2CBridge | null = null;
 let statusBarItem: vscode.StatusBarItem | null = null;
 let isListening = false;
 
-// Decoration type for showing the refined transcript inline (final, shown for 4s)
-const transcriptDecorationType = vscode.window.createTextEditorDecorationType({
-  after: {
-    color: new vscode.ThemeColor("editorCodeLens.foreground"),
-    fontStyle: "italic",
-    margin: "0 0 0 2em",
-  },
-});
-
-// Decoration type for live ghost text while the user is speaking (partial transcript)
-// Rendered in a more muted, ephemeral style — always replaced or cleared before final.
-const partialDecorationType = vscode.window.createTextEditorDecorationType({
-  after: {
-    color: new vscode.ThemeColor("editorGhostText.foreground"),
-    fontStyle: "italic",
-    margin: "0 0 0 2em",
-  },
-});
+// Live-edit state: how many undos are needed to remove the last partial edit.
+// Structural snippets (function/class) count as 1 undo step; dictation also 1.
+let _pendingUndoSteps = 0;
 
 // ── Activation ────────────────────────────────────────────────────────────────
 
@@ -81,7 +68,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Bridge
   bridge = new V2CBridge(config);
   bridge.onStatus.event(_handleStatus);
-  bridge.onPartialTranscript.event(_handlePartialTranscript);
+  bridge.onLiveAction.event(_handleLiveAction);
   bridge.onTranscript.event(_handleTranscript);
   bridge.onAction.event(_handleAction);
   bridge.onServerError.event((msg) => {
@@ -89,8 +76,10 @@ export function activate(context: vscode.ExtensionContext): void {
   });
   bridge.onConnectionChange.event((connected) => {
     _setStatus(connected ? "idle" : "disconnected");
-    // If the server died mid-recording, reset state
-    if (!connected && isListening) { isListening = false; }
+    if (!connected && isListening) {
+      isListening = false;
+      _pendingUndoSteps = 0;
+    }
   });
 
   if (vscode.workspace.getConfiguration("v2c").get<boolean>("autoConnect", true)) {
@@ -109,8 +98,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
   bridge?.dispose();
-  transcriptDecorationType.dispose();
-  partialDecorationType.dispose();
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -129,12 +116,10 @@ function _startListening(): void {
   if (isListening) { return; }
 
   isListening = true;
+  _pendingUndoSteps = 0;
   _setStatus("listening");
 
-  // 1. Send editor context so the server can extract AST identifiers
   _sendEditorContext();
-
-  // 2. Ask the Python server to open its microphone
   bridge.sendStartRecording();
 }
 
@@ -142,8 +127,6 @@ function _stopListening(): void {
   if (!isListening) { return; }
   isListening = false;
   _setStatus("processing");
-
-  // Ask the Python server to stop the mic and run the pipeline
   bridge?.sendStopRecording();
 }
 
@@ -186,52 +169,34 @@ function _handleStatus(msg: StatusMessage): void {
   }
 }
 
-function _handlePartialTranscript(msg: PartialTranscriptMessage): void {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) { return; }
-
-  // is_final=true is sent by the server to clear the ghost text before the
-  // final ACTION arrives (prevents a flash of stale partial text).
-  if (msg.is_final || !msg.text.trim()) {
-    editor.setDecorations(partialDecorationType, []);
-    return;
+async function _handleLiveAction(msg: LiveActionMessage): Promise<void> {
+  // Step 1 — undo the previous partial edit so we start from a clean slate.
+  if (_pendingUndoSteps > 0) {
+    for (let i = 0; i < _pendingUndoSteps; i++) {
+      await vscode.commands.executeCommand("undo");
+    }
+    _pendingUndoSteps = 0;
   }
 
-  const line = editor.selection.active.line;
-  const eol  = new vscode.Position(line, editor.document.lineAt(line).range.end.character);
-
-  editor.setDecorations(partialDecorationType, [{
-    range: new vscode.Range(eol, eol),
-    renderOptions: { after: { contentText: ` 🎤 ${msg.text}` } },
-  }]);
+  if (msg.is_partial) {
+    // Step 2 — apply the new partial code into the document.
+    const steps = await _applyAction(msg.action["action_type"] as string, msg.action);
+    _pendingUndoSteps = steps;
+    // Don't ack partial actions — server doesn't wait for it.
+  } else {
+    // Final action: apply and keep. Reset undo state.
+    await _applyAction(msg.action["action_type"] as string, msg.action);
+    _pendingUndoSteps = 0;
+    bridge?.sendAck(msg.action_id);
+    _setStatus("idle");
+  }
 }
 
-function _handleTranscript(msg: TranscriptMessage): void {
-  const showTranscript = vscode.workspace
-    .getConfiguration("v2c")
-    .get<boolean>("showTranscript", true);
-  if (!showTranscript) { return; }
-
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) { return; }
-
-  const line = editor.selection.active.line;
-  const eol  = new vscode.Position(line, editor.document.lineAt(line).range.end.character);
-
-  editor.setDecorations(transcriptDecorationType, [{
-    range: new vscode.Range(eol, eol),
-    renderOptions: { after: { contentText: ` ⟵ "${msg.refined}"` } },
-  }]);
-
-  setTimeout(() => editor.setDecorations(transcriptDecorationType, []), 4_000);
-}
-
+// Legacy ACTION message handler (kept for compatibility, same logic)
 async function _handleAction(msg: ActionMessage): Promise<void> {
   const { action, action_id } = msg;
-  const actionType = (action["action_type"] as string) ?? "";
-
   try {
-    await _applyAction(actionType, action);
+    await _applyAction(action["action_type"] as string, action);
     bridge?.sendAck(action_id);
   } catch (err) {
     vscode.window.showErrorMessage(`[V2C] Failed to apply action: ${err}`);
@@ -240,62 +205,67 @@ async function _handleAction(msg: ActionMessage): Promise<void> {
   }
 }
 
-// ── Action executor ───────────────────────────────────────────────────────────
+function _handleTranscript(_msg: TranscriptMessage): void {
+  // Transcript is informational only in live-edit mode.
+  // No decoration shown — the code is already in the document.
+}
+
+// ── Action executor — returns number of undo steps applied ───────────────────
 
 async function _applyAction(
   actionType: string,
   action: Record<string, unknown>
-): Promise<void> {
+): Promise<number> {
   const editor = vscode.window.activeTextEditor;
 
   switch (actionType) {
     case ACTION.DICTATION: {
-      if (!editor) { return; }
-      await editor.edit((eb) =>
-        eb.insert(editor.selection.active, (action["text"] as string) ?? "")
-      );
-      break;
+      if (!editor) { return 0; }
+      const text = (action["text"] as string) ?? "";
+      if (!text) { return 0; }
+      await editor.edit((eb) => eb.insert(editor.selection.active, text));
+      return 1;
     }
 
     case ACTION.ADD_FUNCTION: {
-      if (!editor) { return; }
+      if (!editor) { return 0; }
       const name   = (action["target_name"] as string) ?? "new_function";
       const params = ((action["parameters"] as string[]) ?? []).join(", ");
       await editor.insertSnippet(
         new vscode.SnippetString(`\ndef ${name}(${params}):\n    \${1:pass}\n`)
       );
-      break;
+      return 1;
     }
 
     case ACTION.ADD_CLASS: {
-      if (!editor) { return; }
+      if (!editor) { return 0; }
       const name = (action["target_name"] as string) ?? "NewClass";
       await editor.insertSnippet(
         new vscode.SnippetString(
           `\nclass ${name}:\n    def __init__(self) -> None:\n        \${1:pass}\n`
         )
       );
-      break;
+      return 1;
     }
 
     case ACTION.ADD_IMPORT: {
-      if (!editor) { return; }
+      if (!editor) { return 0; }
       const module = (action["target_name"] as string) ?? "";
-      if (!module) { return; }
+      if (!module) { return 0; }
       await editor.edit((eb) =>
         eb.insert(new vscode.Position(0, 0), `import ${module}\n`)
       );
-      break;
+      return 1;
     }
 
     case ACTION.DELETE_FUNCTION:
     case ACTION.DELETE_CLASS: {
       const name = (action["target_name"] as string) ?? "";
-      if (!name || !editor) { return; }
+      if (!name || !editor) { return 0; }
       await vscode.commands.executeCommand("workbench.action.findInFiles", {
         query: `def ${name}`, isRegex: false,
       });
-      break;
+      return 0; // no document edit to undo
     }
 
     case ACTION.NAVIGATE: {
@@ -311,32 +281,31 @@ async function _applyAction(
       } else {
         await vscode.commands.executeCommand("workbench.action.gotoSymbol");
       }
-      break;
+      return 0; // navigation has no document edit to undo
     }
 
     case ACTION.GENERATE: {
-      if (!editor) { return; }
+      if (!editor) { return 0; }
       await editor.insertSnippet(
         new vscode.SnippetString(
           `# TODO (voice): ${(action["description"] as string) ?? ""}\n\${1:}`
         )
       );
-      break;
+      return 1;
     }
 
     case ACTION.NEWLINE: {
-      if (!editor) { return; }
+      if (!editor) { return 0; }
       const count = (action["count"] as number) ?? 1;
-      // Insert newlines at the cursor, then re-indent via VS Code's built-in
-      // "editor.action.insertLineAfter" so Python indentation is preserved.
       for (let i = 0; i < count; i++) {
         await vscode.commands.executeCommand("editor.action.insertLineAfter");
       }
-      break;
+      return count;
     }
 
     default:
       console.warn(`[V2C] Unknown action type: ${actionType}`);
+      return 0;
   }
 }
 

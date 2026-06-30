@@ -41,6 +41,7 @@ from v2c.bridge.protocol import (
     ContextMessage,
     EditorContext,
     ListeningStatus,
+    LiveActionMessage,
     PartialTranscriptMessage,
     ServerErrorMessage,
     StartRecordingMessage,
@@ -141,7 +142,7 @@ class SessionHandler:
         audio = self._streamer_engine.stop()
         self._recording = False
 
-        # Cancel the partial-forwarding task (it will also exit via sentinel)
+        # Cancel the partial live-edit task
         if self._partial_task is not None:
             self._partial_task.cancel()
             try:
@@ -149,9 +150,6 @@ class SessionHandler:
             except asyncio.CancelledError:
                 pass
             self._partial_task = None
-
-        # Clear ghost text from the extension before final result arrives
-        await self._send(PartialTranscriptMessage(text="", is_final=True))
 
         try:
             await self._run_pipeline(audio)
@@ -163,17 +161,50 @@ class SessionHandler:
 
     async def _stream_partials(self) -> None:
         """
-        Forward partial transcripts from the StreamingASREngine to the extension.
+        For each partial transcript from the ASR engine:
+          1. Run a fast rule-only pipeline (no ASR, no LLM, no refiner).
+          2. Send a LIVE_ACTION(is_partial=True) to the extension.
+          3. The extension applies it immediately into the document,
+             undoing the previous partial edit first if there was one.
 
-        Runs as an asyncio Task for the duration of a recording session.
-        Exits when: (a) the engine sends None sentinel, or (b) task is cancelled.
+        When the user stops, _handle_stop_recording runs the full
+        pipeline (with proper ASR on the complete audio) and sends
+        LIVE_ACTION(is_partial=False), which the extension keeps permanently.
         """
         try:
             async for text in self._streamer_engine.partials():
-                await self._send(PartialTranscriptMessage(text=text))
-                logger.info("→ WebSocket PARTIAL_TRANSCRIPT: %r", text[:80])
+                await self._run_partial_pipeline(text)
         except asyncio.CancelledError:
             pass  # normal — cancelled by _handle_stop_recording
+
+    async def _run_partial_pipeline(self, text: str) -> None:
+        """
+        Fast synchronous-only pipeline for partial transcripts.
+
+        Skips: ASR (text already transcribed), LLM refiner, LLM parser.
+        Uses only: rule-based router + rule-based dispatcher.
+        This keeps latency under ~5ms so live edits feel instant.
+        """
+        if not text.strip():
+            return
+
+        routing = router.classify(text)
+        logger.info("▶ Partial pipeline: %r → %s", text[:60], routing.intent.name)
+
+        if routing.intent == IntentType.DICTATION:
+            from v2c.ast_engine.editor_action import DictationAction
+            action = DictationAction(text=text)
+        else:
+            # COMMAND or AMBIGUOUS — try rules; fall back to dictation
+            action = rules.dispatch(text)
+
+        action_id = str(uuid.uuid4())
+        await self._send(LiveActionMessage(
+            action_id=action_id,
+            action=action.to_dict(),
+            is_partial=True,
+        ))
+        logger.info("→ LIVE_ACTION(partial) id=%s type=%s", action_id[:8], type(action).__name__)
 
     def _handle_audio_chunk(self, msg: AudioChunkMessage) -> None:
         """Legacy: buffer PCM chunks sent from the client."""
@@ -202,7 +233,7 @@ class SessionHandler:
             await self._send_status(ListeningStatus.READY)
 
     # ------------------------------------------------------------------ #
-    # Core pipeline
+    # Core pipeline (full, runs on stop)
     # ------------------------------------------------------------------ #
 
     async def _run_pipeline(self, audio: np.ndarray) -> None:
@@ -249,10 +280,14 @@ class SessionHandler:
         else:  # AMBIGUOUS
             action = await llm_parser.parse(refined, refine_ctx)
 
-        # ── 5. Send action to extension ───────────────────────────────────
+        # ── 5. Send final live action (is_partial=False) — replaces last partial
         action_id = str(uuid.uuid4())
-        await self._send(ActionMessage(action_id=action_id, action=action.to_dict()))
-        logger.info("Action dispatched: id=%s type=%s", action_id[:8], type(action).__name__)
+        await self._send(LiveActionMessage(
+            action_id=action_id,
+            action=action.to_dict(),
+            is_partial=False,
+        ))
+        logger.info("→ LIVE_ACTION(final) id=%s type=%s", action_id[:8], type(action).__name__)
 
     # ------------------------------------------------------------------ #
     # Main message loop

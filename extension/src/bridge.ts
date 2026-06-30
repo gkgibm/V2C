@@ -30,6 +30,7 @@ export const MSG = {
   // Server → Client
   STATUS: "STATUS",
   PARTIAL_TRANSCRIPT: "PARTIAL_TRANSCRIPT",
+  LIVE_ACTION: "LIVE_ACTION",
   TRANSCRIPT: "TRANSCRIPT",
   ACTION: "ACTION",
   SERVER_ERROR: "SERVER_ERROR",
@@ -70,6 +71,13 @@ export interface PartialTranscriptMessage {
   is_final: boolean;
 }
 
+export interface LiveActionMessage {
+  type: "LIVE_ACTION";
+  action_id: string;
+  action: Record<string, unknown>;
+  is_partial: boolean;
+}
+
 export interface ServerErrorMessage {
   type: "SERVER_ERROR";
   message: string;
@@ -78,6 +86,7 @@ export interface ServerErrorMessage {
 export type ServerMessage =
   | StatusMessage
   | PartialTranscriptMessage
+  | LiveActionMessage
   | TranscriptMessage
   | ActionMessage
   | ServerErrorMessage;
@@ -99,6 +108,7 @@ export class V2CBridge {
   // Event emitters — extension.ts subscribes to these
   readonly onStatus = new vscode.EventEmitter<StatusMessage>();
   readonly onPartialTranscript = new vscode.EventEmitter<PartialTranscriptMessage>();
+  readonly onLiveAction = new vscode.EventEmitter<LiveActionMessage>();
   readonly onTranscript = new vscode.EventEmitter<TranscriptMessage>();
   readonly onAction = new vscode.EventEmitter<ActionMessage>();
   readonly onServerError = new vscode.EventEmitter<ServerErrorMessage>();
@@ -150,6 +160,7 @@ export class V2CBridge {
     this.disconnect();
     this.onStatus.dispose();
     this.onPartialTranscript.dispose();
+    this.onLiveAction.dispose();
     this.onTranscript.dispose();
     this.onAction.dispose();
     this.onServerError.dispose();
@@ -203,6 +214,9 @@ export class V2CBridge {
         break;
       case MSG.PARTIAL_TRANSCRIPT:
         this.onPartialTranscript.fire(msg as PartialTranscriptMessage);
+        break;
+      case MSG.LIVE_ACTION:
+        this.onLiveAction.fire(msg as LiveActionMessage);
         break;
       case MSG.TRANSCRIPT:
         this.onTranscript.fire(msg as TranscriptMessage);

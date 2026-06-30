@@ -50,6 +50,7 @@ class MessageType(str, Enum):
     PARTIAL_TRANSCRIPT = "PARTIAL_TRANSCRIPT"  # live text while still speaking
     TRANSCRIPT = "TRANSCRIPT"                  # final transcript after stop
     ACTION = "ACTION"
+    LIVE_ACTION = "LIVE_ACTION"                # live code edit while speaking
     SERVER_ERROR = "SERVER_ERROR"
 
 
@@ -154,6 +155,26 @@ class TranscriptMessage(BaseModel):
     refined: str
 
 
+class LiveActionMessage(BaseModel):
+    """
+    A live code edit produced from a partial transcript while the user is
+    still speaking.
+
+    ``is_partial=True``: the extension applies this edit immediately, but
+    records it for undo if the next partial produces a different result.
+
+    ``is_partial=False``: this is the final clean result from the full
+    pipeline after stop — the extension keeps it permanently.
+
+    ``action`` carries the same dict shape as ActionMessage.action, so the
+    same _applyAction() handler is reused.
+    """
+    type: Literal[MessageType.LIVE_ACTION] = MessageType.LIVE_ACTION
+    action_id: str
+    action: dict[str, Any]
+    is_partial: bool = True
+
+
 class ActionMessage(BaseModel):
     """
     Deliver the computed editor action to the VS Code extension.
@@ -189,6 +210,7 @@ ClientMessage = Union[
 ServerMessage = Union[
     StatusMessage,
     PartialTranscriptMessage,
+    LiveActionMessage,
     TranscriptMessage,
     ActionMessage,
     ServerErrorMessage,
