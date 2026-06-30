@@ -23,6 +23,7 @@ from v2c.ast_engine.editor_action import (
     EditorAction,
     NavigateAction,
     NavigationTarget,
+    NewlineAction,
     StructuralAction,
     StructuralActionType,
 )
@@ -156,6 +157,49 @@ def _map_add_import(text: str) -> EditorAction | None:
             action_type=StructuralActionType.ADD_IMPORT,
             target_name=m.group(1).strip(),
         )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Newline / next-line commands
+# ---------------------------------------------------------------------------
+
+
+@_register
+def _map_newline(text: str) -> EditorAction | None:
+    """
+    Match explicit newline / next-line intent.
+
+    Handles:
+      "new line", "next line", "newline", "enter", "line break", "blank line",
+      "new line twice", "next line three times", …
+    """
+    m = re.match(
+        r"(?:new\s+line|next\s+line|newline|line\s+break|blank\s+line|enter)"
+        r"(?:\s+(?:twice|two\s+times?|x\s*2))?",
+        text.strip(),
+        re.I,
+    )
+    if m:
+        count = 2 if re.search(r"twice|two\s+times?|x\s*2", text, re.I) else 1
+        return NewlineAction(count=count)
+
+    # "two new lines", "three new lines", etc.
+    m2 = re.match(
+        r"(\w+)\s+(?:new\s+lines?|next\s+lines?|newlines?|line\s+breaks?)",
+        text.strip(),
+        re.I,
+    )
+    if m2:
+        word_to_num = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "a": 1, "an": 1, "double": 2, "triple": 3,
+        }
+        raw = m2.group(1).lower()
+        count = word_to_num.get(raw, None) or (int(raw) if raw.isdigit() else None)
+        if count:
+            return NewlineAction(count=count)
+
     return None
 
 

@@ -132,8 +132,23 @@ class GenerateAction(_BaseAction):
     description: str = ""
 
 
+@dataclass
+class NewlineAction(_BaseAction):
+    """
+    Insert one or more newlines at the cursor and optionally re-indent.
+
+    Voice triggers: "new line", "next line", "enter", "line break",
+                    "blank line", "newline".
+    ``count`` controls how many newlines to insert (default 1).
+    """
+    action_type: str = field(default="NEWLINE", init=False)
+    count: int = 1
+
+
 # ---------------------------------------------------------------------------
 # Union type for type annotations throughout the codebase
 # ---------------------------------------------------------------------------
 
-EditorAction = DictationAction | StructuralAction | NavigateAction | GenerateAction
+EditorAction = (
+    DictationAction | StructuralAction | NavigateAction | GenerateAction | NewlineAction
+)

@@ -36,6 +36,7 @@ const ACTION = {
   RENAME: "RENAME",
   NAVIGATE: "NAVIGATE",
   GENERATE: "GENERATE",
+  NEWLINE: "NEWLINE",
 } as const;
 
 // ── Extension state ───────────────────────────────────────────────────────────
@@ -320,6 +321,17 @@ async function _applyAction(
           `# TODO (voice): ${(action["description"] as string) ?? ""}\n\${1:}`
         )
       );
+      break;
+    }
+
+    case ACTION.NEWLINE: {
+      if (!editor) { return; }
+      const count = (action["count"] as number) ?? 1;
+      // Insert newlines at the cursor, then re-indent via VS Code's built-in
+      // "editor.action.insertLineAfter" so Python indentation is preserved.
+      for (let i = 0; i < count; i++) {
+        await vscode.commands.executeCommand("editor.action.insertLineAfter");
+      }
       break;
     }
 

@@ -70,6 +70,11 @@ _COMMAND_PREFIXES: list[re.Pattern[str]] = [
     re.compile(r"^(undo|redo|save|open|close|split)\b", re.I),
     re.compile(r"^(show|hide|toggle)\s+(terminal|sidebar|panel|explorer)\b", re.I),
     re.compile(r"^(generate|write me|create me)\b", re.I),
+    # Explicit cursor / newline navigation
+    re.compile(r"^(new\s+line|next\s+line|newline|line\s+break|blank\s+line)\b", re.I),
+    re.compile(r"^enter\s*$", re.I),   # bare "enter" → newline (not dictation)
+    re.compile(r"^\d+\s+(new\s+lines?|next\s+lines?)", re.I),
+    re.compile(r"^(two|three|four|five|double|triple)\s+(new\s+lines?|next\s+lines?)", re.I),
 ]
 
 # Scored keywords — each match adds to a score; if score ≥ threshold the

@@ -78,3 +78,25 @@ class TestIntentRouter:
         assert isinstance(result, RoutingResult)
         assert isinstance(result.intent, IntentType)
         assert 0.0 <= result.confidence <= 1.0
+
+    # ── Newline commands ───────────────────────────────────────────────────
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "new line",
+            "next line",
+            "newline",
+            "line break",
+            "blank line",
+            "enter",
+            "new line twice",
+            "two new lines",
+            "three next lines",
+        ],
+    )
+    def test_newline_commands_are_command(self, text: str) -> None:
+        result = classify(text)
+        assert result.intent == IntentType.COMMAND, (
+            f"Expected COMMAND for {text!r}, got {result.intent}"
+        )

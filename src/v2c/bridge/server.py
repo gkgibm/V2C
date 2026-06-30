@@ -66,13 +66,14 @@ class SessionHandler:
     Manages the V2C processing pipeline for a single WebSocket connection.
     """
 
-    def __init__(self, ws: Any, asr: ASREngine) -> None:
+    def __init__(self, ws: Any, asr: ASREngine, streamer: StreamingASREngine) -> None:
         self._ws = ws
         self._asr = asr
+        self._streamer_engine = streamer   # shared pre-warmed engine (reused each session)
         self._refiner = get_refiner()
         self._context: EditorContext = EditorContext()
-        # Streaming ASR — created fresh on each START_RECORDING
-        self._streamer: StreamingASREngine | None = None
+        # Active recording state
+        self._recording = False
         self._partial_task: asyncio.Task | None = None
         # Legacy: buffer for AUDIO_CHUNK mode
         self._pcm_buf: bytearray = bytearray()
@@ -105,39 +106,42 @@ class SessionHandler:
         )
 
     async def _handle_start_recording(self, _msg: StartRecordingMessage) -> None:
-        if self._streamer is not None:
+        if self._recording:
             logger.warning("START_RECORDING received while already recording — ignoring")
             return
 
         try:
-            self._streamer = StreamingASREngine()
-            self._streamer.start()
+            # start() is async: loads model via executor if not pre-warmed,
+            # so the event loop stays unblocked.
+            await self._streamer_engine.start()
+            self._recording = True
             await self._send_status(ListeningStatus.LISTENING, "Microphone open")
 
-            # Launch background task that forwards partial transcripts to extension
+            # Launch the task AFTER start() returns so the queue exists.
             self._partial_task = asyncio.create_task(self._stream_partials())
+            logger.info("Recording started — partials task running.")
 
         except Exception as exc:
             logger.error("Failed to open microphone: %s", exc)
+            self._recording = False
             await self._send_error(
                 f"Could not open microphone: {exc}. "
                 "Check System Settings → Privacy → Microphone and that "
                 "sounddevice is installed."
             )
-            self._streamer = None
 
     async def _handle_stop_recording(self, _msg: StopRecordingMessage) -> None:
-        if self._streamer is None:
+        if not self._recording:
             logger.warning("STOP_RECORDING received but no active recording — ignoring")
             return
 
         await self._send_status(ListeningStatus.PROCESSING)
 
-        # Stop streaming — returns the full captured audio
-        audio = self._streamer.stop()
-        self._streamer = None
+        # Stop streaming engine — returns full audio, non-blocking
+        audio = self._streamer_engine.stop()
+        self._recording = False
 
-        # Cancel the partial-forwarding task
+        # Cancel the partial-forwarding task (it will also exit via sentinel)
         if self._partial_task is not None:
             self._partial_task.cancel()
             try:
@@ -146,7 +150,7 @@ class SessionHandler:
                 pass
             self._partial_task = None
 
-        # Clear the live ghost text from the extension
+        # Clear ghost text from the extension before final result arrives
         await self._send(PartialTranscriptMessage(text="", is_final=True))
 
         try:
@@ -159,17 +163,15 @@ class SessionHandler:
 
     async def _stream_partials(self) -> None:
         """
-        Forward partial transcripts from StreamingASREngine to the extension.
+        Forward partial transcripts from the StreamingASREngine to the extension.
 
         Runs as an asyncio Task for the duration of a recording session.
-        Each partial update replaces the previous ghost text in the editor.
+        Exits when: (a) the engine sends None sentinel, or (b) task is cancelled.
         """
-        if self._streamer is None:
-            return
         try:
-            async for text in self._streamer.partials():
+            async for text in self._streamer_engine.partials():
                 await self._send(PartialTranscriptMessage(text=text))
-                logger.debug("Partial: %r", text[:60])
+                logger.info("→ WebSocket PARTIAL_TRANSCRIPT: %r", text[:80])
         except asyncio.CancelledError:
             pass  # normal — cancelled by _handle_stop_recording
 
@@ -287,9 +289,9 @@ class SessionHandler:
             pass
         finally:
             # Clean up if client disconnects mid-recording
-            if self._streamer is not None:
-                self._streamer.stop()
-                self._streamer = None
+            if self._recording:
+                self._streamer_engine.stop()
+                self._recording = False
             if self._partial_task is not None:
                 self._partial_task.cancel()
                 self._partial_task = None
@@ -311,8 +313,13 @@ async def start_server() -> None:
     asr = ASREngine()
     await asr.warmup()
 
+    # Pre-warm the streaming engine at startup so the first recording session
+    # has zero model-load latency (loads in executor, non-blocking).
+    streamer = StreamingASREngine()
+    await streamer.warmup()
+
     async def handler(ws: Any) -> None:
-        session = SessionHandler(ws, asr)
+        session = SessionHandler(ws, asr, streamer)
         await session.run()
 
     logger.info(
