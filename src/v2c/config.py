@@ -96,8 +96,8 @@ class Settings(BaseSettings):
         description="Base URL of the local Ollama server.",
     )
     ollama_model: str = Field(
-        default="qwen3:1.7b",
-        description="Ollama model for voice-to-code generation. qwen3:1.7b recommended.",
+        default="qwen2.5-coder:7b",
+        description="Ollama model for voice-to-code generation. qwen2.5-coder:7b recommended.",
     )
     ollama_timeout: float = Field(
         default=8.0,

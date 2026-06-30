@@ -1,24 +1,31 @@
 """
 LLM-backed code generator using a local Ollama model.
 
-Uses ``qwen3:1.7b`` (default) with thinking disabled for ~500ms responses.
-Falls back to rule-based pipeline if Ollama is unavailable.
+Default model: ``qwen2.5-coder:7b`` — a code-specialized 7B model,
+~1s per call when warm (~4s cold start on first use).
 
-The few-shot prompt teaches the model to:
-  - Interpret natural language operators ("is equal to", "plus", "minus", etc.)
-  - Treat the whole utterance as one code block, not multiple functions
-  - Omit "remove pass" instead of creating a pass line
-  - Use "next line" as a line separator inside a block
-  - Output ONLY raw Python code, no markdown, no explanation
+Falls back to rule-based pipeline if Ollama is unreachable or returns an error.
+
+Prompt strategy
+---------------
+Few-shot examples teach the model the exact natural-language → Python mapping:
+  "is equal to"     → =
+  "plus/minus/times/divided by" → +/-/*//
+  "is greater/less than" → >/< 
+  "remove pass"     → omit the pass statement
+  "modulo"          → %
+  "dot"             → .
+  "next line"       → line separator (already handled by Whisper output)
+
+The model is instructed to output ONLY raw Python code — no markdown fences,
+no explanations, no trailing commentary.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
-from functools import lru_cache
 
 import httpx
 
@@ -26,66 +33,86 @@ from v2c.config import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Few-shot examples (teaches the model the exact mapping we need) ───────────
+# ── Few-shot prompt ───────────────────────────────────────────────────────────
 
 _FEW_SHOT = """\
+Convert voice command to Python code. Output ONLY the raw Python code, nothing else, no markdown fences.
+
 voice: add function greet
 code:
 def greet():
     pass
 
-voice: add function add, remove pass, x is equal to 10, y is equal to 20, return x plus y
+voice: add function calc, remove pass, x is equal to 5, y is equal to 3, return x plus y
 code:
-def add():
-    x = 10
-    y = 20
+def calc():
+    x = 5
+    y = 3
     return x + y
-
-voice: add function calculate, remove pass, x is equal to 10, next line, y is equal to 10, next line, print x plus y
-code:
-def calculate():
-    x = 10
-    y = 10
-    print(x + y)
 
 voice: import numpy
 code:
 import numpy
+
+voice: x is equal to 10, y is equal to 20, print x plus y
+code:
+x = 10
+y = 20
+print(x + y)
 
 voice: add class Animal, remove pass, name is equal to dog
 code:
 class Animal:
     name = "dog"
 
-voice: x is equal to 5, y is equal to 3, print x times y
-code:
-x = 5
-y = 3
-print(x * y)
-
-voice: for i in range 10, next line, print i
+voice: for i in range 10, print i times 2
 code:
 for i in range(10):
-    print(i)
+    print(i * 2)
 
-"""
+voice: if x is greater than 5, print x is big, else print x is small
+code:
+if x > 5:
+    print("x is big")
+else:
+    print("x is small")
 
-_PROMPT_TEMPLATE = (
-    "Convert voice to Python. Output ONLY code.\n\n"
-    + _FEW_SHOT
-    + "voice: {command}\ncode:\n"
-)
+voice: for i in range 10, if i modulo 2 is equal to 0, print i
+code:
+for i in range(10):
+    if i % 2 == 0:
+        print(i)
 
-# ── Markdown fence stripper ───────────────────────────────────────────────────
+voice: import json, import os, result is equal to json dot loads open config dot json dot read
+code:
+import json
+import os
+result = json.loads(open('config.json').read())
+
+voice: add function multiply, remove pass, a is equal to 3, b is equal to 4, return a times b
+code:
+def multiply():
+    a = 3
+    b = 4
+    return a * b
+
+voice: {command}
+code:"""
+
+# ── Markdown / commentary stripper ───────────────────────────────────────────
 
 _FENCE_RE = re.compile(r"```[a-zA-Z]*\n?|```", re.M)
+# Strip any "voice:" continuation the model might hallucinate
+_VOICE_RE = re.compile(r"\nvoice:.*", re.S)
 
 
-def _strip_fences(text: str) -> str:
-    return _FENCE_RE.sub("", text).strip()
+def _clean(text: str) -> str:
+    text = _FENCE_RE.sub("", text)
+    text = _VOICE_RE.sub("", text)
+    return text.strip()
 
 
-# ── Ollama client ─────────────────────────────────────────────────────────────
+# ── Ollama async client ───────────────────────────────────────────────────────
 
 
 async def generate_code(
@@ -101,21 +128,20 @@ async def generate_code(
     voice_command : str
         Raw (or lightly refined) ASR transcript.
     context_code : str
-        Current file content (up to ~800 chars) sent as context so the
-        model can match variable names, indentation style, etc.
+        Last ~800 chars of the active file — gives the model indentation
+        style, variable names, and class context.
     timeout : float | None
-        HTTP timeout in seconds.  Defaults to ``settings.ollama_timeout``.
+        HTTP timeout seconds. Defaults to ``settings.ollama_timeout``.
 
     Returns
     -------
     str
-        Raw Python code string, ready to insert at the cursor.
-        Returns empty string on failure.
+        Raw Python code ready to insert at the cursor.
+        Returns empty string on any failure (caller uses rule fallback).
     """
     timeout = timeout or settings.ollama_timeout
-    prompt = _PROMPT_TEMPLATE.format(command=voice_command.strip())
+    prompt = _FEW_SHOT.format(command=voice_command.strip())
 
-    # Prepend a snippet of context so the model can infer indentation / names.
     if context_code.strip():
         snippet = context_code.strip()[-800:]
         prompt = f"# Current file context:\n{snippet}\n\n" + prompt
@@ -124,7 +150,9 @@ async def generate_code(
         "model": settings.ollama_model,
         "prompt": prompt,
         "stream": False,
-        "think": False,               # disable chain-of-thought for speed
+        # keep_alive=-1 keeps the model loaded in RAM indefinitely between
+        # calls so subsequent requests skip the ~3s load penalty.
+        "keep_alive": -1,
         "options": {
             "temperature": 0,
             "num_predict": 400,
@@ -143,10 +171,10 @@ async def generate_code(
             data = resp.json()
 
         raw = data.get("response", "").strip()
-        code = _strip_fences(raw)
+        code = _clean(raw)
         elapsed = time.perf_counter() - t0
         logger.info(
-            "Ollama %s: %.0fms → %d chars of code",
+            "Ollama %s: %.0fms → %d chars",
             settings.ollama_model,
             elapsed * 1000,
             len(code),
@@ -155,24 +183,36 @@ async def generate_code(
 
     except httpx.ConnectError:
         logger.warning(
-            "Ollama not reachable at %s — falling back to rules",
+            "Ollama not reachable at %s — using rule fallback",
             settings.ollama_host,
         )
         return ""
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "Ollama HTTP %s: %s — using rule fallback",
+            exc.response.status_code,
+            exc.response.text[:120],
+        )
+        return ""
     except Exception as exc:
-        logger.warning("Ollama error (%s): %s", type(exc).__name__, exc)
+        logger.warning("Ollama error (%s): %s — using rule fallback", type(exc).__name__, exc)
         return ""
 
 
 async def warmup() -> bool:
     """
-    Send a tiny request to Ollama so the model is loaded and cached.
-    Returns True if Ollama is available, False otherwise.
+    Pre-load the model into Ollama's RAM so the first real call is fast.
+    Sets keep_alive=-1 so it stays loaded until Ollama is stopped.
+    Returns True if available, False otherwise.
     """
     logger.info("Warming up Ollama model %s …", settings.ollama_model)
-    code = await generate_code("add function test", timeout=30.0)
+    code = await generate_code("add function warmup", timeout=30.0)
     if code:
-        logger.info("Ollama warm-up complete.")
+        logger.info("Ollama %s ready (~1s per call).", settings.ollama_model)
         return True
-    logger.warning("Ollama not available — will use rule-based fallback.")
+    logger.warning(
+        "Ollama unavailable — rule-based fallback active. "
+        "Start Ollama and run: ollama pull %s",
+        settings.ollama_model,
+    )
     return False
